@@ -1,105 +1,113 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
-	"os"
-	"strconv"
 	"time"
 
-	"github.com/fllarpy/apm-probe"
+	_ "github.com/mattn/go-sqlite3"
+
+	apm "github.com/fllarpy/apm-probe"
+	httpinstrumentation "github.com/fllarpy/apm-probe/instrumentation/http"
+	sqlinstrumentation "github.com/fllarpy/apm-probe/instrumentation/sql"
+	"github.com/fllarpy/apm-probe/internal/ports/http_reporter"
 )
 
 func main() {
-	// Create a new ServeMux to register our handlers to.
-	mux := http.NewServeMux()
+	ctx := context.Background()
+	probe, store, err := apm.NewProbe(ctx, "hybrid-service")
+	if err != nil {
+		log.Fatalf("failed to initialize apm probe: %v", err)
+	}
+	defer probe.Shutdown(ctx)
 
-	// Register the handlers directly. The middleware will be applied to the mux.
-	mux.HandleFunc("/", helloHandler)
-
-	// This handler demonstrates an instrumented client request.
-	mux.HandleFunc("/client-request", clientRequestHandler)
-
-	// This handler will always return a 500 error to test error collection.
-	mux.HandleFunc("/error", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("This is a simulated error."))
-	})
-
-	// Register the metrics handler if the probe is enabled.
-	metricsHandler := apm_probe.MetricsHandler()
-	if metricsHandler != nil {
-		debugEndpointPath := getEnv("APM_DEBUG_ENDPOINT", "/debug/apm")
-		mux.Handle(debugEndpointPath, metricsHandler)
-		log.Printf("Metrics endpoint enabled at http://localhost:8080%s", debugEndpointPath)
-	} else {
-		log.Println("APM probe is disabled, not serving metrics.")
+	db, err := sqlinstrumentation.Open("sqlite3", "file:./apm-probe/example/test.db?cache=shared&mode=memory")
+	if err != nil {
+		log.Fatalf("failed to open instrumented db connection: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT)`); err != nil {
+		log.Fatalf("failed to create table: %v", err)
 	}
 
-	log.Println("Starting server on :8080")
-	log.Println("Test endpoint: http://localhost:8080/")
-	log.Println("Client request test endpoint: http://localhost:8080/client-request")
-	log.Println("Error test endpoint: http://localhost:8080/error")
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", helloHandler)
+	mux.HandleFunc("/db", dbHandler(db))
+	mux.HandleFunc("/error", erroringHandler)
+	mux.HandleFunc("/db-error", dbErroringHandler(db))
+	mux.HandleFunc("/slow", slowHandler)
+	mux.HandleFunc("/n-plus-one", nPlusOneHandler(db))
 
-	// Start the server, wrapping our mux with the APM middleware.
-	// This ensures all requests, including 404s handled by the mux itself, are captured.
-	if err := http.ListenAndServe(":8080", apm_probe.Middleware()(mux)); err != nil {
+	metricsHandler := http_reporter.NewHandler(store)
+	mux.Handle("/debug/apm", metricsHandler)
+
+	instrumentedHandler := httpinstrumentation.NewMiddleware(mux, "http-server")
+
+	log.Printf("Starting server for service 'hybrid-service' on :8080")
+	log.Println("Test endpoint: http://localhost:8080/")
+	log.Println("DB test endpoint: http://localhost:8080/db")
+	log.Println("Error test endpoint: http://localhost:8080/error")
+	log.Println("DB Error test endpoint: http://localhost:8080/db-error")
+	log.Println("Slow endpoint for profiling: http://localhost:8080/slow")
+	log.Println("N+1 test endpoint: http://localhost:8080/n-plus-one")
+	log.Println("Legacy metrics endpoint: http://localhost:8080/debug/apm")
+
+	if err := http.ListenAndServe(":8080", instrumentedHandler); err != nil {
 		log.Fatalf("could not start server: %v", err)
 	}
 }
 
 func helloHandler(w http.ResponseWriter, r *http.Request) {
-	// Simulate some work
 	time.Sleep(50 * time.Millisecond)
-
-	// Chance to return a 4xx or 5xx error
-	rand.Seed(time.Now().UnixNano())
-	n := rand.Intn(100)
-	if n < 5 {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintln(w, "Oh no, a 500 error!")
-		return
-	} else if n < 10 {
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprintln(w, "Oops, a 400 error!")
-		return
-	}
-
-	fmt.Fprintln(w, "Hello, world!")
+	fmt.Fprintln(w, "Hello, from the hybrid server!")
 }
 
-func clientRequestHandler(w http.ResponseWriter, r *http.Request) {
-	// Create an instrumented client. We pass nil to use a client based on http.DefaultClient.
-	client := apm_probe.NewClient(nil)
-
-	// Make a request to an external service.
-	resp, err := client.Get("https://httpbin.org/delay/1")
-	if err != nil {
-		http.Error(w, "Failed to make client request", http.StatusInternalServerError)
-		log.Printf("Client request failed: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	fmt.Fprintf(w, "Made a client request to httpbin.org, status: %s", resp.Status)
+func slowHandler(w http.ResponseWriter, r *http.Request) {
+	time.Sleep(600 * time.Millisecond)
+	fmt.Fprintln(w, "This was a slow request.")
 }
 
-// getEnv reads an environment variable or returns a default value.
-func getEnv(key, defaultValue string) string {
-	if value, exists := os.LookupEnv(key); exists {
-		return value
-	}
-	return defaultValue
+func erroringHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusInternalServerError)
+	fmt.Fprintln(w, "This endpoint always returns an error.")
 }
 
-// getEnvAsBool reads a boolean environment variable or returns a default value.
-func getEnvAsBool(key string, defaultValue bool) bool {
-	if value, exists := os.LookupEnv(key); exists {
-		if boolValue, err := strconv.ParseBool(value); err == nil {
-			return boolValue
+func dbHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		row := db.QueryRowContext(ctx, "SELECT 'John Doe' as name")
+		var name string
+		if err := row.Scan(&name); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
+		fmt.Fprintf(w, "User name from DB: %s\n", name)
 	}
-	return defaultValue
+}
+
+func dbErroringHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		_, err := db.ExecContext(ctx, "SELECT * FROM non_existent_table")
+		if err != nil {
+			http.Error(w, "database error", http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintln(w, "This should not be reached.")
+	}
+}
+
+func nPlusOneHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		for i := 0; i < 10; i++ {
+			row := db.QueryRowContext(ctx, "SELECT name FROM users WHERE id = ?", 1)
+			var name string
+			_ = row.Scan(&name)
+		}
+		fmt.Fprintln(w, "Executed 10 identical queries.")
+	}
 }

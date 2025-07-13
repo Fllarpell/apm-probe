@@ -1,0 +1,4 @@
+# APM Probe Configuration
+service_name: "my-awesome-app"
+exporter: "logging"
+log_level: "debug" 
